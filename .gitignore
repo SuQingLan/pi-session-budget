@@ -1,0 +1,7 @@
+node_modules/
+*.log
+
+# 本地私有价目表（由 scripts/cheapmodel-pricing-refresh.py 生成，站点专属，不要提交）
+cheapmodel-pricing.json
+*.bak
+*.bak-*

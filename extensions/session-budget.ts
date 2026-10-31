@@ -46,7 +46,68 @@ export const HOST_API_USAGE = [
 	"ctx.getContextUsage",
 	"ctx.model.provider",
 	"ctx.model.id",
+	"ctx.hasUI",
 ] as const;
+
+/* ---------------- 周期性重绘（re-paint） ---------------- */
+
+export interface Repainter { stop(): void }
+
+/** 周期重绘的默认间隔（毫秒）；配置 refreshMs 可改，0 = 关闭 */
+export const DEFAULT_REFRESH_MS = 2000;
+
+/**
+ * 周期性重绘：`ctx.ui.setWidget` 是 fire-and-forget 推送，前端重挂载 / SSE 重连 / 丢包后
+ * 不会回填旧 widget，只能靠下一次推送恢复 —— 所以定时无条件重推一次。
+ * `intervalMs <= 0` 表示不启用（返回 undefined）。定时器带 `unref()`（不阻止 pi 进程退出）。
+ */
+export function startRepainter(opts: {
+	render: () => void;
+	intervalMs: number;
+	setInterval?: typeof setInterval;
+	clearInterval?: typeof clearInterval;
+}): Repainter | undefined {
+	if (!(opts.intervalMs > 0)) return undefined; // 0 / 负数 / NaN → 关闭
+	const setIv = opts.setInterval ?? setInterval;
+	const clearIv = opts.clearInterval ?? clearInterval;
+	const timer: any = setIv(() => {
+		try {
+			opts.render();
+		} catch {
+			// 周期渲染异常必须吞掉：不能让定时器抛错影响会话
+		}
+	}, opts.intervalMs);
+	// 不阻止 pi 进程退出
+	try {
+		if (typeof timer?.unref === "function") timer.unref();
+	} catch {
+		/* 某些定时器实现没有 unref，忽略 */
+	}
+	let stopped = false;
+	return {
+		stop() {
+			if (stopped) return; // 幂等
+			stopped = true;
+			try {
+				clearIv(timer);
+			} catch {
+				/* 已清理过，忽略 */
+			}
+		},
+	};
+}
+
+/**
+ * 周期重绘间隔：环境变量 `SESSION_BUDGET_REFRESH_MS` 优先于配置文件 `refreshMs`，
+ * 缺省 2000；非法值（负数 / 非数字）按默认处理，不抛错。0 = 关闭。
+ */
+export function refreshIntervalMs(cfg?: any, env: NodeJS.ProcessEnv = process.env): number {
+	const raw = env.SESSION_BUDGET_REFRESH_MS ?? cfg?.refreshMs;
+	if (raw === undefined || raw === null) return DEFAULT_REFRESH_MS;
+	const n = typeof raw === "string" ? (raw.trim() === "" ? Number.NaN : Number(raw)) : Number(raw);
+	if (!Number.isFinite(n) || n < 0) return DEFAULT_REFRESH_MS;
+	return n;
+}
 
 function readJson(file: string): any {
 	try {
@@ -664,6 +725,37 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	}
 
+	// ---- 周期重绘：setWidget 是推送式的，前端重挂载 / 丢包后不会回填，只能靠下一次推送修复 ----
+	/** 最近一次成功渲染用的 ctx（周期重绘需要） */
+	let lastCtx: any;
+	let repainter: Repainter | undefined;
+	let repainterStarted = false;
+
+	/** 只在真有 UI 时才值得重绘：无 UI（ctx.hasUI === false）或没有 setWidget 都不启动 */
+	function uiAvailable(ctx: any): boolean {
+		return ctx?.hasUI !== false && typeof ctx?.ui?.setWidget === "function";
+	}
+
+	function stopRepainter(): void {
+		try {
+			repainter?.stop();
+		} catch {
+			/* 停止失败不影响会话 */
+		}
+		repainter = undefined;
+		repainterStarted = false;
+		lastCtx = undefined;
+	}
+
+	/** 第一次成功渲染之后启动；内容相同也照推，所以无条件下发 */
+	function ensureRepainter(ctx: any): void {
+		if (repainter || repainterStarted) return;
+		// 先判断有没有 UI，再置位：否则一次无 UI 的渲染会把开关永久关掉
+		if (!uiAvailable(ctx)) return;
+		repainterStarted = true;
+		repainter = startRepainter({ render: () => render(lastCtx), intervalMs: refreshIntervalMs(readJson(join(AGENT_DIR, "session-budget.json")) ?? {}) });
+	}
+
 	function render(ctx: any) {
 		try {
 			const entries: any[] = ctx.sessionManager.getEntries();
@@ -730,6 +822,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			ctx.ui.setWidget(KEY, lines);
+			// 渲染成功且拿得到可用 ctx 之后才启动周期重绘（内容相同也照推）
+			lastCtx = ctx;
+			ensureRepainter(ctx);
 		} catch (err) {
 			if (process.env.SESSION_BUDGET_DEBUG) console.error("session-budget render failed", err);
 			// 显示失败不影响会话
@@ -747,12 +842,20 @@ export default function (pi: ExtensionAPI) {
 		return { message: { ...m, usage: { ...m.usage, cost: c } } };
 	});
 
-	for (const ev of ["session_start", "message_end", "turn_end", "agent_end", "session_compact", "model_select"] as const) {
+	// session_info_changed：切会话时可能触发，立即重绘一次
+	for (const ev of ["session_start", "message_end", "turn_end", "agent_end", "session_compact", "model_select", "session_info_changed"] as const) {
 		try {
 			pi.on(ev as any, async (_e: any, ctx: any) => render(ctx));
 		} catch {
 			// 某些事件名在旧版本不存在时忽略
 		}
+	}
+
+	// 会话结束：停掉定时器，避免继续往已失效的会话推 widget
+	try {
+		pi.on("session_shutdown" as any, async () => stopRepainter());
+	} catch {
+		// 旧版本没有 session_shutdown 时忽略
 	}
 
 	pi.registerCommand("budget", {

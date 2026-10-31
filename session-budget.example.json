@@ -2,5 +2,6 @@
   "defaultUsd": 0,
   "warnAt": 0.8,
   "currency": "auto",
-  "includeSubagents": true
+  "includeSubagents": true,
+  "refreshMs": 2000
 }

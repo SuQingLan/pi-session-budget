@@ -80,6 +80,8 @@ function makeCtx(opts: {
 			notify: (msg: string, level?: string) => notes.push({ msg, level }),
 		};
 	}
+	// hasUI 是宿主字段：无 ui 替身时同时置 false（扩展据此判断要不要起周期重绘）
+	ctx.hasUI = opts.ui !== false;
 	return { ctx, widgets, notes };
 }
 
@@ -615,4 +617,65 @@ test("withTempDir 结束后恢复 PI_CODING_AGENT_DIR 与 SESSION_BUDGET_DEBUG",
 		if (prevDebug === undefined) delete process.env.SESSION_BUDGET_DEBUG;
 		else process.env.SESSION_BUDGET_DEBUG = prevDebug;
 	}
+});
+
+/* ---------------- 周期重绘（re-paint） ---------------- */
+
+/** 临时改环境变量，结束后恢复原值（进程级变量，不恢复会污染后续测试） */
+async function withEnv(name: string, value: string, fn: () => Promise<void>): Promise<void> {
+	const prev = process.env[name];
+	process.env[name] = value;
+	try {
+		await fn();
+	} finally {
+		if (prev === undefined) delete process.env[name];
+		else process.env[name] = prev;
+	}
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// 缺陷回归：切回窗口时 widget 不显示——前端重挂载 / SSE 丢包不会回填旧 widget，
+// 扩展必须周期性无条件重推，下一次推送才能把状态行修回来。
+test("周期重绘：refreshMs=50 时 setWidget 次数持续增加，session_shutdown 后停止", async () => {
+	await withTempDir(async (root) => {
+		const agentDir = join(root, "agent");
+		mkdirSync(agentDir, { recursive: true });
+		await withEnv("SESSION_BUDGET_REFRESH_MS", "50", async () => {
+			const mod = await loadExt(agentDir);
+			const { pi, handlers } = makeHost();
+			mod.default(pi);
+			const { ctx, widgets } = makeCtx({ entries: [msgEntry({ id: "m1", usage: { input: 1000, output: 500, cacheRead: 200, cacheWrite: 100, cost: { total: 12.34 } } })] });
+			await fire(handlers, "session_start", ctx);
+			const after = widgets.length;
+			assert.ok(after >= 1, "session_start 应先渲染一次");
+			await sleep(150);
+			const later = widgets.length;
+			assert.ok(later > after, `周期重绘应让 setWidget 次数继续增加：${after} → ${later}`);
+			// 内容不变也照推：推上去的行与首次渲染一致
+			assert.deepEqual(widgets[later - 1].lines, widgets[after - 1].lines, "周期重绘应推送相同内容（不因内容相同跳过）");
+			await fire(handlers, "session_shutdown", ctx);
+			const stopped = widgets.length;
+			await sleep(150);
+			assert.equal(widgets.length, stopped, `session_shutdown 后应停表：${stopped} → ${widgets.length}`);
+		});
+	});
+});
+
+test("周期重绘：refreshMs=0 时 setWidget 次数不再增加", async () => {
+	await withTempDir(async (root) => {
+		const agentDir = join(root, "agent");
+		mkdirSync(agentDir, { recursive: true });
+		await withEnv("SESSION_BUDGET_REFRESH_MS", "0", async () => {
+			const mod = await loadExt(agentDir);
+			const { pi, handlers } = makeHost();
+			mod.default(pi);
+			const { ctx, widgets } = makeCtx({ entries: [msgEntry({ id: "m1", usage: { input: 1000, output: 500, cacheRead: 200, cacheWrite: 100, cost: { total: 12.34 } } })] });
+			await fire(handlers, "session_start", ctx);
+			const after = widgets.length;
+			assert.ok(after >= 1, "session_start 应先渲染一次");
+			await sleep(150);
+			assert.equal(widgets.length, after, `关闭周期重绘后不应再推送：${after} → ${widgets.length}`);
+		});
+	});
 });

@@ -71,7 +71,8 @@ bash install.sh --agent-dir /path/to/agent
   "budgetCurrency": "¥",
   "warnAt": 0.8,
   "currency": "auto",
-  "includeSubagents": true
+  "includeSubagents": true,
+  "refreshMs": 2000
 }
 ```
 
@@ -82,6 +83,26 @@ bash install.sh --agent-dir /path/to/agent
 | `warnAt` | `0.8` | 达到预算的该比例时弹提醒 |
 | `currency` | `"auto"` | `auto` 按实际计价来源；`"¥"` / `"$"` 强制单一符号 |
 | `includeSubagents` | `true` | 是否把子代理费用计入总额与预算 |
+| `refreshMs` | `2000` | 周期重绘间隔（毫秒），`0` = 关闭（环境变量 `SESSION_BUDGET_REFRESH_MS` 优先） |
+
+## 刷新机制
+
+状态行是**推送式**的：扩展调 `ctx.ui.setWidget` 只是往会话推一次消息，宿主并不回传确认，前端也不保留
+可重放的副本。而 pi-web 切回某个会话时会**重挂载聊天视图**，只在挂载那一刻拉一次快照回填 widget；
+SSE 重连和会话复用都不会重新触发 `session_start`。于是只要那一次推送被错过（推送发生在挂载之前、
+连接断开过、宿主清空过扩展 UI），状态行就会一直空着，直到下次偶然的事件才恢复。
+
+修法只能落在扩展侧：**周期性无条件重推**（`refreshMs`，默认 2000 ms）。内容与上次相同也照推 ——
+内容相同不代表前端已经收到了。所以周期重绘只是**幂等的自我修复**，不会改变任何数字口径。
+
+- 调小（如 `500`）：切回窗口后更快恢复，代价是渲染更频繁（每次渲染要扫一次子会话，实测约 16 ms）。
+- 调大（如 `10000`）：更省 CPU，但掉线的状态行可能空上十秒。
+- 设为 `0`：完全关闭。概率上仍然能用（事件触发时照常渲染），但**错过一次推送就会一直空着**，
+  直到下一次 `session_start` / `message_end` / `turn_end` / `agent_end` / `session_compact` /
+  `model_select` / `session_info_changed`。
+- 临时关闭或临时改间隔用环境变量 `SESSION_BUDGET_REFRESH_MS`（优先于配置文件），非法值按默认 2000 处理。
+- 无 UI 的环境（`ctx.hasUI === false` 或没有 `ui.setWidget`）不启动定时器；定时器带 `unref()`，
+  不会阻止 pi 进程退出；会话结束（`session_shutdown`）时停表。
 
 ## 计价口径
 
@@ -201,7 +222,7 @@ CM_USER=你的账号 CM_PASS=你的密码 python scripts/cheapmodel-pricing-refr
 
 | 路径 | 用途 |
 |---|---|
-| `pi.on` | 订阅 `session_start` / `message_end` / `turn_end` / `agent_end` / `session_compact` / `model_select` |
+| `pi.on` | 订阅 `session_start` / `message_end` / `turn_end` / `agent_end` / `session_compact` / `model_select` / `session_info_changed`（立即重绘）与 `session_shutdown`（停表） |
 | `pi.registerCommand` | 注册 `/budget` |
 | `pi.appendEntry` | 把预算写进会话（`/budget 5`、`/budget off`） |
 | `ctx.ui.setWidget` | 渲染状态行 |
@@ -211,6 +232,7 @@ CM_USER=你的账号 CM_PASS=你的密码 python scripts/cheapmodel-pricing-refr
 | `ctx.modelRegistry.find` | 读 `models.json` 单价 |
 | `ctx.getContextUsage` | 当前上下文占用 |
 | `ctx.model.provider` / `ctx.model.id` | 摘要记录等无模型字段时按当前模型计价 |
+| `ctx.hasUI` | 判断当前环境有没有 UI：`false` 时不启动周期重绘定时器 |
 
 > **上游 pi 改宿主 API 时，此清单与契约测试需要同步更新**：源码里增删 `pi.*` / `ctx.*` 调用后，
 > 改 `HOST_API_USAGE`；mock 宿主（`test/contract/extension.test.ts` 的 `makeHost` / `makeCtx`）也要补上，
@@ -255,8 +277,8 @@ npm run check:host   # 核对宿主 API 符号在真实 pi 类型声明里仍存
 
 | 目录 | 内容 |
 |---|---|
-| `test/unit/` | 去重指纹、金额与「真实/估算」分列、`parseUsageText` 解析容错、`parseChildFile` 流式边界（跨块行 / 超长行 / UTF-8 多字节 / 坏行） |
-| `test/contract/` | 扩展对外契约：注册的命令、渲染产物、`/budget` 写入与去重口径、`ui` 缺失不崩、宿主 API 清单覆盖 |
+| `test/unit/` | 去重指纹、金额与「真实/估算」分列、`parseUsageText` 解析容错、`parseChildFile` 流式边界（跨块行 / 超长行 / UTF-8 多字节 / 坏行）、周期重绘器（间隔语义 / `unref` / 幂等 `stop`） |
+| `test/contract/` | 扩展对外契约：注册的命令、渲染产物、`/budget` 写入与去重口径、`ui` 缺失不崩、周期重绘真的在跑 / 关闭后不跑、宿主 API 清单覆盖 |
 
 > `node --test <目录>` 在 Node 24 会把目录当模块入口（报 `Cannot find module`），所以这里用不带参数的 `node --test`，由 Node 自己递归发现；演示脚本放在 `scripts/render-demo.ts` 而非 `test/`，避免被当成测试文件。
 

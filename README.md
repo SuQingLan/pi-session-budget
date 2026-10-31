@@ -118,10 +118,19 @@ sessions/<cwd-slug>/2026-10-28T14-20-39-680Z_<id>.jsonl   ← 子代理会话
 CM_USER=你的账号 CM_PASS=你的密码 python scripts/cheapmodel-pricing-refresh.py --magpie
 ```
 
+> 口令写在命令行会进 shell history，推荐交互式读入：
+>
+> ```bash
+> read -rs -p "站点口令: " CM_PASS; echo
+> export CM_USER=<你的账号> CM_PASS
+> python scripts/cheapmodel-pricing-refresh.py --magpie
+> unset CM_PASS
+> ```
+
 | 环境变量 | 说明 |
 |---|---|
 | `CM_USER` / `CM_PASS` | 站点登录（必需，只在进程内使用，不落盘） |
-| `CM_BASE` | 站点地址，默认 `https://api.cheapmodel.net` |
+| `CM_BASE` | 站点地址（可选：不设则沿用已有价格表里的站点地址；两者都无则报错） |
 | `PI_CODING_AGENT_DIR` | pi agent 目录 |
 | `MAGPIE_CLI` | magpie CLI 路径（默认在 PATH 里找 `magpie-cli` / `magpie`） |
 
@@ -132,6 +141,20 @@ CM_USER=你的账号 CM_PASS=你的密码 python scripts/cheapmodel-pricing-refr
 - `--no-merge`：默认会**保留**本次没抓到价的旧规则（站点分组改名/删除时不至于丢掉旧价目），该参数关闭此行为
 
 > 抓价脚本是给"用中转站 + 需要人民币精确口径"的场景准备的；纯官方价场景不需要它。
+
+## 隐私与脱敏
+
+| 项 | 处理方式 |
+|---|---|
+| 站点账号口令 | 只从环境变量读，**只在进程内使用**，不写盘、不进日志 |
+| 站点 API Key | 仅用前缀做分组匹配，**不会写进生成的价格表** |
+| 扩展本体 | **零网络请求**，只读本地 `sessions/*.jsonl` 与 `settings.json` / `models.json` |
+| 会话内容 | 只统计 token 与费用，**不读取、不外传 prompt 正文** |
+| 私有价格表 | `cheapmodel-pricing.json` 已进 `.gitignore`，属站点专属数据 |
+| 本地配置 / 会话文件 | `session-budget.json`、`*.jsonl` 已进 `.gitignore` |
+| 站点地址 | 用 `CM_BASE` 指定；本文档不写死具体站点域名 |
+
+> 本仓库只收录扩展源码与示例配置。任何带账号、密钥、价格表、会话记录的内容都请留在本地。
 
 ## 兼容性
 

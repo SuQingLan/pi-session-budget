@@ -5,3 +5,9 @@ node_modules/
 cheapmodel-pricing.json
 *.bak
 *.bak-*
+
+# 用户本地配置（预算 / 币种偏好），示例见 session-budget.example.json
+session-budget.json
+
+# 会话文件（含 prompt 与业务隐私，绝不提交）
+*.jsonl

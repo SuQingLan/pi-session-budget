@@ -5,7 +5,7 @@ Usage (credentials only via env vars, never stored):
 
 Environment:
     CM_USER, CM_PASS      site login (required)
-    CM_BASE               site base url (default https://api.cheapmodel.net)
+    CM_BASE               site base url (optional: reused from an existing cheapmodel-pricing.json)
     PI_CODING_AGENT_DIR   pi agent dir (default ~/.pi/agent)
     MAGPIE_PROVIDERS      magpie providers.json (default ~/.config/magpie/providers.json)
     MAGPIE_CLI            magpie cli path (default: magpie-cli / magpie on PATH)
@@ -21,9 +21,24 @@ import http.cookiejar, json, os, re, shutil, subprocess, sys, time, urllib.error
 from collections import defaultdict
 from datetime import datetime, timezone
 
-BASE = os.environ.get("CM_BASE", "https://api.cheapmodel.net")
 AGENT_DIR = os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(os.path.expanduser("~"), ".pi", "agent")
 OUT = os.path.join(AGENT_DIR, "cheapmodel-pricing.json")
+
+
+def _base_from_existing_table():
+    """站点地址不写死在本脚本里：优先 CM_BASE，否则沿用已有价格表 source 字段里的站点地址。"""
+    try:
+        if os.path.exists(OUT):
+            src = (json.load(open(OUT, encoding="utf-8")) or {}).get("source") or ""
+            m = re.match(r"(https?://[^/\s]+)", src)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+BASE = os.environ.get("CM_BASE") or _base_from_existing_table()
 MAGPIE_PROVIDERS = os.environ.get("MAGPIE_PROVIDERS") or os.path.join(os.path.expanduser("~"), ".config", "magpie", "providers.json")
 MAGPIE_CLI = os.environ.get("MAGPIE_CLI") or shutil.which("magpie-cli") or shutil.which("magpie") or "magpie-cli"
 TIER_SPLIT = 272000
@@ -86,6 +101,9 @@ def main():
     user, pw = os.environ.get("CM_USER"), os.environ.get("CM_PASS")
     if not user or not pw:
         sys.exit("set CM_USER and CM_PASS")
+    if not BASE:
+        sys.exit("set CM_BASE to your site base url (e.g. https://<your-site>), "
+                 "or keep an existing <agentDir>/cheapmodel-pricing.json to reuse its site")
     api("/api/v1/auth/config?locale=zh")
     api("/api/v1/auth/login", {"username": user, "password": pw})
     site = api("/api/v1/models")

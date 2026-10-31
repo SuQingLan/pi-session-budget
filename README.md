@@ -216,6 +216,24 @@ CM_USER=你的账号 CM_PASS=你的密码 python scripts/cheapmodel-pricing-refr
 > 改 `HOST_API_USAGE`；mock 宿主（`test/contract/extension.test.ts` 的 `makeHost` / `makeCtx`）也要补上，
 > 否则「宿主 API 清单」用例会逐项报缺。
 
+#### 符号存在性检查（挡上游改名）
+
+mock 宿主是**手写测试替身**，不会随上游 pi 变更 —— 上游把 `setWidget` 改名后，所有 mock 测试照样全绿，
+扩展在真实 pi 里却静默失效（状态行整行不显示）。为此本仓库会直接读**真实宿主包**的类型声明，
+逐个核对上表里的符号是否**仍然存在**：
+
+```bash
+npm run check:host        # = node scripts/host-api-check.mjs
+```
+
+它会定位 `@earendil-works/pi-coding-agent`（依次尝试 `PI_HOST_PACKAGE_DIR` 环境变量 → 本仓库向上解析
+node_modules → `PATH` 上的 `pi` 可执行文件旁 → `~/.pi/agent/npm/node_modules` → `$PI_CODING_AGENT_DIR/npm/node_modules`），
+沿类型声明的 re-export 链找到符号，**缺一个就退出码 1**。该检查同时作为契约测试
+（`test/contract/host-api.test.ts`）运行；**找不到宿主包时跳过而非失败**，保证没装 pi 的环境也能跑。
+
+> 局限：只核对**名字**在不在，不校验签名与类型 —— 那是完整类型检查（`tsc` + devDependencies）的活，
+> 本仓库坚持「运行时零依赖、clone 即可跑」，暂不引入。
+
 ## 离线调试
 
 不启动 pi 也能验证计算：
@@ -230,6 +248,7 @@ bun run scripts/render-demo.ts <session.jsonl> [agentDir]
 
 ```bash
 npm test          # = node --test（Node 递归发现 test/ 下的 *.test.ts）
+npm run check:host   # 核对宿主 API 符号在真实 pi 类型声明里仍存在
 ```
 
 需要 Node >= 22.6（原生执行 `.ts`；实测 Node 24）。测试零第三方依赖，只用 `node:test` + `node:assert/strict`：

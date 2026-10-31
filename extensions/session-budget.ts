@@ -30,6 +30,24 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(process.env.USERPROFILE || process.env.HOME || ".", ".pi", "agent");
 const KEY = "session-budget";
 
+/**
+ * 本扩展用到的宿主 API 清单（上游变更时这里需要同步；契约测试据此校验 mock 覆盖）。
+ * 路径写法：pi.* / ctx.ui.* / ctx.sessionManager.* / ctx.modelRegistry.* / ctx.model.* / ctx.getContextUsage。
+ */
+export const HOST_API_USAGE = [
+	"pi.on",
+	"pi.registerCommand",
+	"pi.appendEntry",
+	"ctx.ui.setWidget",
+	"ctx.ui.notify",
+	"ctx.sessionManager.getEntries",
+	"ctx.sessionManager.getSessionFile",
+	"ctx.modelRegistry.find",
+	"ctx.getContextUsage",
+	"ctx.model.provider",
+	"ctx.model.id",
+] as const;
+
 function readJson(file: string): any {
 	try {
 		return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : undefined;
@@ -210,7 +228,7 @@ function callCost(ctx: any, provider: string | undefined, model: string | undefi
 
 /** 一条 assistant 调用的原始用量记录（缓存用，计价时再乘价格） */
 export interface CallRecord { id?: string; provider?: string; model?: string; ts?: number; usage: any; summary?: boolean }
-interface ChildStats { records: CallRecord[]; profile?: string; description?: string; badLines: number }
+export interface ChildStats { records: CallRecord[]; profile?: string; description?: string; badLines: number }
 
 /* ---------------- 去重指纹 ---------------- */
 
@@ -328,7 +346,7 @@ export function parseUsageText(text: string, opts?: { maxLineBytes?: number }): 
  * 某行超过 maxLineBytes 时丢弃该行剩余部分直到下一个 "\n"（不无限累积）。
  * 总坏行数 = 流式丢弃的超长行 + 解析失败行。
  */
-function parseChildFile(file: string, opts?: { maxLineBytes?: number }): ChildStats | undefined {
+export function parseChildFile(file: string, opts?: { maxLineBytes?: number }): ChildStats | undefined {
 	const maxLineBytes = opts?.maxLineBytes ?? 4 * 1024 * 1024;
 	const CHUNK = 64 * 1024;
 	let fd: number | undefined;
@@ -395,7 +413,7 @@ function parseChildFile(file: string, opts?: { maxLineBytes?: number }): ChildSt
 	};
 }
 
-interface SubUsage {
+export interface SubUsage {
 	cost: Money; split: CostSplit; input: number; output: number; cacheRead: number; cacheWrite: number;
 	calls: number; agents: number; dupSkipped: number; badLines: number;
 	profiles: Record<string, { cost: Money; calls: number }>;
@@ -549,9 +567,12 @@ function compactionThreshold(provider?: string, modelId?: string, contextWindow?
 	return contextWindow - reserve;
 }
 
-interface MainUsage {
+export interface MainUsage {
 	cost: Money; split: CostSplit;
 	input: number; output: number; cacheRead: number; cacheWrite: number; calls: number;
+}
+function emptyMain(): MainUsage {
+	return { cost: newMoney(), split: emptyCostSplit(), input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 };
 }
 
 /**
@@ -559,7 +580,7 @@ interface MainUsage {
  * 这样 fork/clone 出来的子会话副本不会重复计费。
  */
 function collectMainUsage(ctx: any, entries: any[], seen: Set<string>): MainUsage {
-	const out: MainUsage = { cost: newMoney(), split: emptyCostSplit(), input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 };
+	const out = emptyMain();
 	for (const e of entries) {
 		const isMsg = e.type === "message" && e.message?.role === "assistant";
 		const u = isMsg ? e.message.usage : e.type === "compaction" || e.type === "branch_summary" ? e.usage : undefined;
@@ -587,24 +608,41 @@ function collectMainUsage(ctx: any, entries: any[], seen: Set<string>): MainUsag
 	return out;
 }
 
-/** 主 + 子的成本构成（给 /budget 输出用） */
-function costSplitOf(ctx: any, entries: any[]): CostSplit {
-	const total = emptyCostSplit();
-	const seenFingerprints = new Set<string>();
-	mergeSplit(total, collectMainUsage(ctx, entries, seenFingerprints).split);
-	const cfg = readJson(join(AGENT_DIR, "session-budget.json")) ?? {};
-	if (cfg.includeSubagents !== false) {
-		mergeSplit(total, collectSubagentUsage(ctx, ctx.sessionManager.getSessionFile?.(), seenFingerprints).split);
-	}
-	return total;
+/** 一次聚合的结果：主会话 + 子代理（带去重），渲染与 /budget 命令共用同一份 */
+export interface UsageAgg { main: MainUsage; sub: SubUsage; total: Money; split: CostSplit }
+
+/** 配置里是否把子代理计入总额（唯一读取点，渲染与命令都走这里） */
+function includeSubagents(cfg: any): boolean {
+	return cfg?.includeSubagents !== false;
 }
 
-/** /budget 输出末尾的成本构成行（算不出来时退化为空构成，不影响命令） */
-function costBreakdownLine(ctx: any, entries: any[]): string {
+/**
+ * 一次聚合：主会话 + 子代理（带去重），供渲染与 /budget 命令共用。
+ * 主会话先计入 seen，子代理里已出现过的 entry 跳过——命令与 widget 因此口径一致。
+ * cfg 可传入（渲染处已经读过配置，避免同一次渲染重复读配置文件）。
+ */
+export function aggregateUsage(ctx: any, entries: any[], cfg?: any): UsageAgg {
+	const seen = new Set<string>();
+	const main = collectMainUsage(ctx, entries, seen);
+	const conf = cfg ?? readJson(join(AGENT_DIR, "session-budget.json")) ?? {};
+	const sub = includeSubagents(conf) ? collectSubagentUsage(ctx, ctx.sessionManager.getSessionFile?.(), seen) : emptySub();
+	const total = newMoney();
+	addMoney(total, main.cost.cny, "¥");
+	addMoney(total, main.cost.usd, "$");
+	addMoney(total, sub.cost.cny, "¥");
+	addMoney(total, sub.cost.usd, "$");
+	const split = emptyCostSplit();
+	mergeSplit(split, main.split);
+	mergeSplit(split, sub.split);
+	return { main, sub, total, split };
+}
+
+/** 聚合失败时退化为空聚合（不影响命令与渲染） */
+function safeAggregateUsage(ctx: any, entries: any[]): UsageAgg {
 	try {
-		return costBreakdownText(costSplitOf(ctx, entries));
+		return aggregateUsage(ctx, entries);
 	} catch {
-		return costBreakdownText(emptyCostSplit());
+		return { main: emptyMain(), sub: emptySub(), total: newMoney(), split: emptyCostSplit() };
 	}
 }
 
@@ -631,24 +669,17 @@ export default function (pi: ExtensionAPI) {
 			const entries: any[] = ctx.sessionManager.getEntries();
 			const cfg = readJson(join(AGENT_DIR, "session-budget.json")) ?? {};
 			CURRENCY = cfg.currency === "¥" || cfg.currency === "$" ? cfg.currency : "auto";
-			const seenFingerprints = new Set<string>();
-			const main = collectMainUsage(ctx, entries, seenFingerprints);
+			// 与 /budget 命令共用同一个聚合函数（includeSubagents 在 aggregateUsage 内统一判定）
+			const agg = aggregateUsage(ctx, entries, cfg);
+			const { main, sub } = agg;
 			const mainCost = main.cost;
 			const { input, output, cacheRead, cacheWrite, calls } = main;
 
-			const includeSub = cfg.includeSubagents !== false;
-			const sub = includeSub ? collectSubagentUsage(ctx, ctx.sessionManager.getSessionFile?.(), seenFingerprints) : emptySub();
 			if (process.env.SESSION_BUDGET_DEBUG) {
 				console.error(`session-budget: 子代理 ${sub.agents} 个 · dupSkipped ${sub.dupSkipped} · 坏行 ${sub.badLines}`);
 			}
-			const totalSplit = emptyCostSplit();
-			mergeSplit(totalSplit, main.split);
-			mergeSplit(totalSplit, sub.split);
-			const totalCost = newMoney();
-			addMoney(totalCost, mainCost.cny, "¥");
-			addMoney(totalCost, mainCost.usd, "$");
-			addMoney(totalCost, sub.cost.cny, "¥");
-			addMoney(totalCost, sub.cost.usd, "$");
+			const totalSplit = agg.split;
+			const totalCost = agg.total;
 
 			const budget = sessionBudget(entries);
 			const warnAt = cfg.warnAt ?? 0.8;
@@ -729,12 +760,14 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const a = args.trim();
 			const low = a.toLowerCase();
+			// 命令与 widget 共用同一份聚合结果：子代理数与金额、成本构成都取自它（口径一致）
+			const agg = safeAggregateUsage(ctx, ctx.sessionManager.getEntries() as any[]);
 			// /budget 输出末尾固定追加成本构成行
-			const breakdown = costBreakdownLine(ctx, ctx.sessionManager.getEntries() as any[]);
+			const breakdown = costBreakdownText(agg.split);
 			if (!a) {
 				const b = sessionBudget(ctx.sessionManager.getEntries() as any[]);
-				const sub = collectSubagentUsage(ctx, ctx.sessionManager.getSessionFile?.());
-				const extra = sub.agents ? `，子代理 ${sub.agents} 个 / ${fmtMoney(sub.cost)}` : "";
+				const sub = agg.sub;
+				const extra = sub.agents ? `，子代理 ${sub.agents} 个 / ${displayMoney(sub.cost)}` : "";
 				ctx.ui.notify((b ? `本会话预算：${fmtNum(b.cur, b.amount)}${extra}` : `本会话未设预算（/budget 5 设为 ¥5，/budget $5 设为 $5）${extra}`) + `\n${breakdown}`, "info");
 			} else if (low === "off" || low === "0") {
 				pi.appendEntry(KEY, { usd: null });

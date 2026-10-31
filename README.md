@@ -117,6 +117,9 @@ widget 的总额在**全部来自估算**时加 `≈` 前缀（如 `💰 ≈¥29
 `/budget` 输出末尾固定给出一行构成：`成本构成：真实 $12.34 · 估算 ¥45.67`（没有真实成本时显示 `真实成本未记录`）。
 预算比较（百分比、超支、告警）仍按总额算。
 
+**同一份聚合**：主会话 + 子代理只聚合一次（`aggregateUsage`，先计主会话指纹、再按同一集合去重子代理），
+widget 与 `/budget` 都取这次聚合结果 —— 所以通知里的「子代理 N 个 / 金额」与 widget 的子代理行、构成行永远同口径。
+
 「没有成本记录」与「明确记录为 0」是两回事：`usage` 里**没有 `cost` 字段**（或不是有限数）时，该条调用不计入金额、也不标为真实成本，构成里显示 `真实成本未记录`；只有 `usage.cost.total` 是有限数（含显式 `0`）才算真实成本（如 `真实 $0.0000`）。
 
 **解析容错**：子会话 jsonl 按 64 KB 分块流式读取；
@@ -192,6 +195,27 @@ CM_USER=你的账号 CM_PASS=你的密码 python scripts/cheapmodel-pricing-refr
 - Windows / macOS / Linux 均可（`install.sh` 支持 Git Bash）。
 - 子代理行依赖 pi-web 的 subagent 机制；纯 CLI 且没有子代理时该行不显示，其余功能正常。
 
+### 宿主 API 依赖清单
+
+扩展实际用到的宿主 API 列在源码导出的 `HOST_API_USAGE` 里（契约测试按这份清单逐项校验 mock 宿主覆盖）：
+
+| 路径 | 用途 |
+|---|---|
+| `pi.on` | 订阅 `session_start` / `message_end` / `turn_end` / `agent_end` / `session_compact` / `model_select` |
+| `pi.registerCommand` | 注册 `/budget` |
+| `pi.appendEntry` | 把预算写进会话（`/budget 5`、`/budget off`） |
+| `ctx.ui.setWidget` | 渲染状态行 |
+| `ctx.ui.notify` | 预算告警与 `/budget` 输出 |
+| `ctx.sessionManager.getEntries` | 读主会话用量记录（含 compaction / branch_summary） |
+| `ctx.sessionManager.getSessionFile` | 定位当前会话文件，据此找子代理会话 |
+| `ctx.modelRegistry.find` | 读 `models.json` 单价 |
+| `ctx.getContextUsage` | 当前上下文占用 |
+| `ctx.model.provider` / `ctx.model.id` | 摘要记录等无模型字段时按当前模型计价 |
+
+> **上游 pi 改宿主 API 时，此清单与契约测试需要同步更新**：源码里增删 `pi.*` / `ctx.*` 调用后，
+> 改 `HOST_API_USAGE`；mock 宿主（`test/contract/extension.test.ts` 的 `makeHost` / `makeCtx`）也要补上，
+> 否则「宿主 API 清单」用例会逐项报缺。
+
 ## 离线调试
 
 不启动 pi 也能验证计算：
@@ -212,8 +236,8 @@ npm test          # = node --test（Node 递归发现 test/ 下的 *.test.ts）
 
 | 目录 | 内容 |
 |---|---|
-| `test/unit/` | 去重指纹、金额与「真实/估算」分列、`parseUsageText` 解析容错 |
-| `test/contract/` | 扩展对外契约：注册的命令、渲染产物、`/budget` 写入、`ui` 缺失不崩 |
+| `test/unit/` | 去重指纹、金额与「真实/估算」分列、`parseUsageText` 解析容错、`parseChildFile` 流式边界（跨块行 / 超长行 / UTF-8 多字节 / 坏行） |
+| `test/contract/` | 扩展对外契约：注册的命令、渲染产物、`/budget` 写入与去重口径、`ui` 缺失不崩、宿主 API 清单覆盖 |
 
 > `node --test <目录>` 在 Node 24 会把目录当模块入口（报 `Cannot find module`），所以这里用不带参数的 `node --test`，由 Node 自己递归发现；演示脚本放在 `scripts/render-demo.ts` 而非 `test/`，避免被当成测试文件。
 

@@ -19,13 +19,20 @@ async function loadExt(agentDir: string) {
 	return await import(`../../extensions/session-budget.ts?sb=${++importSeq}`);
 }
 
-/** 自建临时根目录，fn 结束后递归删除 */
+/** 自建临时根目录，fn 结束后递归删除；结束时把改过的环境变量恢复原值 */
 async function withTempDir(fn: (root: string) => Promise<void>): Promise<void> {
 	const root = mkdtempSync(join(tmpdir(), "sb-"));
+	const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const prevDebug = process.env.SESSION_BUDGET_DEBUG;
 	try {
 		await fn(root);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+		// 环境变量是进程级的：不恢复会污染同进程的后续测试与宿主环境
+		if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+		if (prevDebug === undefined) delete process.env.SESSION_BUDGET_DEBUG;
+		else process.env.SESSION_BUDGET_DEBUG = prevDebug;
 	}
 }
 
@@ -80,19 +87,44 @@ async function fire(handlers: Record<string, any[]>, ev: string, ctx: any, event
 	for (const h of handlers[ev] ?? []) await h(event, ctx);
 }
 
-/** 捕获 SESSION_BUDGET_DEBUG 打到 stderr 的调试行 */
+/** 捕获 SESSION_BUDGET_DEBUG 打到 stderr 的调试行（结束后恢复该变量原值） */
 async function withDebug(fn: () => Promise<void>): Promise<string[]> {
 	const errs: string[] = [];
 	const orig = console.error;
+	const prevDebug = process.env.SESSION_BUDGET_DEBUG;
 	process.env.SESSION_BUDGET_DEBUG = "1";
 	console.error = (...a: any[]) => errs.push(a.map(String).join(" "));
 	try {
 		await fn();
 	} finally {
 		console.error = orig;
-		delete process.env.SESSION_BUDGET_DEBUG;
+		if (prevDebug === undefined) delete process.env.SESSION_BUDGET_DEBUG;
+		else process.env.SESSION_BUDGET_DEBUG = prevDebug;
 	}
 	return errs;
+}
+
+/** widget 子代理行里的金额（去掉 ≈ 前缀），用于与 /budget 正文比对 */
+function widgetSubAmount(lines: string[]): string | undefined {
+	const line = lines.find((l) => l.startsWith("🤖 子代理"));
+	return line?.match(/子代理 \d+ 个 · ≈?([^\s·]+)/)?.[1];
+}
+
+/** /budget 通知正文里的「子代理 N 个 / 金额」 */
+function noticeSubAmount(msg: string): string | undefined {
+	return msg.match(/子代理 \d+ 个 \/ ([^\s，]+)/)?.[1];
+}
+
+/** 按 "a.b.c" 路径逐段检查对象上是否真的有这个 API */
+function hasHostPath(obj: any, path: string): boolean {
+	let cur: any = obj;
+	for (const seg of path.split(".")) {
+		if (cur === null || cur === undefined) return false;
+		const boxed = Object(cur);
+		if (!(seg in boxed)) return false;
+		cur = boxed[seg];
+	}
+	return cur !== undefined;
 }
 
 /** 一条主会话 assistant entry（message.timestamp 用毫秒数，与子会话解析口径一致） */
@@ -136,8 +168,13 @@ test("导出面：default + 具名能力", async () => {
 		assert.equal(typeof mod.default, "function");
 		assert.equal(typeof mod.usageFingerprint, "function");
 		assert.equal(typeof mod.parseUsageText, "function");
+		assert.equal(typeof mod.parseUsageLine, "function");
 		assert.equal(typeof mod.emptyCostSplit, "function");
 		assert.equal(typeof mod.addToSplit, "function");
+		// 第 4 轮新增：统一聚合、流式入口、宿主 API 清单
+		assert.equal(typeof mod.aggregateUsage, "function");
+		assert.equal(typeof mod.parseChildFile, "function");
+		assert.ok(Array.isArray(mod.HOST_API_USAGE), "HOST_API_USAGE 应为数组");
 	});
 });
 
@@ -484,5 +521,98 @@ test("/budget 构成金额与 widget 总额一致", async () => {
 		assert.match(breakdown, /估算 \$2\.00/);
 		// 通知首行的子代理金额与构成里的估算额一致（真实 5 + 估算 2 = 总额 7）
 		assert.ok(lines[0].includes("子代理 1 个 / $2.00"), `通知首行子代理金额应与构成一致：${lines[0]}`);
+		// 第 4 轮加强：通知正文的子代理金额必须与 widget 子代理行完全一致（同一份聚合）
+		const subLine = widgets[widgets.length - 1].lines.find((l) => l.startsWith("🤖 子代理"));
+		assert.ok(subLine, `widget 应有子代理行：${widgets[widgets.length - 1].lines.join("\n")}`);
+		const fromWidget = widgetSubAmount(widgets[widgets.length - 1].lines);
+		const fromNotice = noticeSubAmount(msg);
+		assert.ok(fromWidget, `widget 子代理行应能取出金额：${subLine}`);
+		assert.equal(fromNotice, fromWidget, `通知与 widget 的子代理金额必须一致：${fromNotice} vs ${fromWidget}`);
 	});
+});
+
+// 缺陷 F 回归：/budget 命令原先没把去重集合传给子代理统计，通知正文的金额是未去重的。
+// 修法：命令与 widget 共用 aggregateUsage 的同一份聚合结果。
+test("缺陷 F：/budget 的子代理金额 = widget 子代理金额 = 去重后金额", async () => {
+	await withTempDir(async (root) => {
+		const agentDir = join(root, "agent");
+		mkdirSync(agentDir, { recursive: true });
+		// 重复条目：主会话与子代理各一条，内容相同（fork/clone 副本）→ 应被去重
+		const dupUsage = { input: 1_000_000, output: 500_000, cacheRead: 0, cacheWrite: 0 }; // $2.00
+		const dupMessage = { role: "assistant", provider: "magpie", model: "deeps", timestamp: TS, usage: dupUsage };
+		// 子代理独有条目：$1.00
+		const uniqUsage = { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 };
+		const uniqMessage = { role: "assistant", provider: "magpie", model: "deeps", timestamp: TS + 1000, usage: uniqUsage };
+		const { mainFile } = makeSessionTree(root, [
+			{
+				name: "proj-child",
+				lines: [
+					JSON.stringify({ type: "custom", customType: "pi-web:subagent", data: { profile: "worker" } }),
+					JSON.stringify({ type: "message", id: "dup1", timestamp: new Date(TS).toISOString(), message: dupMessage }),
+					JSON.stringify({ type: "message", id: "uniq1", timestamp: new Date(TS + 1000).toISOString(), message: uniqMessage }),
+				],
+			},
+		]);
+		const mainEntries = [
+			{ type: "session", id: "s1" },
+			{ type: "message", id: "dup1", timestamp: new Date(TS).toISOString(), message: dupMessage },
+		];
+		const mod = await loadExt(agentDir);
+		const { pi, handlers, commands } = makeHost();
+		mod.default(pi);
+		const { ctx, widgets, notes } = makeCtx({ entries: mainEntries, sessionFile: mainFile });
+		await fire(handlers, "session_start", ctx);
+		const widgetLines = widgets[widgets.length - 1].lines;
+		const widgetSub = widgetSubAmount(widgetLines);
+		assert.equal(widgetSub, "$1.00", `widget 子代理金额应为去重后的 $1.00：${widgetLines.join("\n")}`);
+		await commands["budget"].handler("", ctx);
+		const msg = notes[notes.length - 1].msg;
+		const noticeSub = noticeSubAmount(msg);
+		assert.equal(noticeSub, "$1.00", `通知子代理金额应为去重后的 $1.00：${msg}`);
+		assert.equal(noticeSub, widgetSub, `通知与 widget 必须同口径：${noticeSub} vs ${widgetSub}`);
+		assert.notEqual(noticeSub, "$3.00", `未去重时会是 $3.00（重复 $2.00 + 独有 $1.00）：${msg}`);
+	});
+});
+
+// 缺口 I：宿主 API 清单 —— 契约测试按清单逐项校验 mock 宿主覆盖
+test("宿主 API 清单：mock 宿主覆盖 HOST_API_USAGE 每一项", async () => {
+	await withTempDir(async (root) => {
+		const agentDir = join(root, "agent");
+		mkdirSync(agentDir, { recursive: true });
+		const mod = await loadExt(agentDir);
+		assert.ok(Array.isArray(mod.HOST_API_USAGE), "HOST_API_USAGE 应为数组");
+		assert.ok(mod.HOST_API_USAGE.length > 0, "HOST_API_USAGE 不应为空");
+		const { pi } = makeHost();
+		const { ctx } = makeCtx({ entries: [] });
+		const host: any = { pi, ctx };
+		for (const path of mod.HOST_API_USAGE) {
+			const head = path.split(".")[0];
+			assert.ok(head === "pi" || head === "ctx", `清单项应以 pi./ctx. 开头：${path}`);
+			assert.ok(hasHostPath(host[head], path.slice(head.length + 1)), `mock 宿主缺少 ${path}`);
+		}
+	});
+});
+
+// 缺口 H：环境变量必须恢复，否则会污染同进程的后续测试与宿主环境
+test("withTempDir 结束后恢复 PI_CODING_AGENT_DIR 与 SESSION_BUDGET_DEBUG", async () => {
+	const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const prevDebug = process.env.SESSION_BUDGET_DEBUG;
+	process.env.SESSION_BUDGET_DEBUG = "keep-me";
+	let seenInside: string | undefined;
+	try {
+		await withTempDir(async (root) => {
+			const agentDir = join(root, "agent");
+			mkdirSync(agentDir, { recursive: true });
+			await loadExt(agentDir);
+			seenInside = process.env.PI_CODING_AGENT_DIR;
+			assert.equal(seenInside, agentDir, "临时目录内应指向临时 agent 目录");
+		});
+		assert.equal(process.env.PI_CODING_AGENT_DIR, prevAgentDir, "PI_CODING_AGENT_DIR 应恢复原值");
+		assert.equal(process.env.SESSION_BUDGET_DEBUG, "keep-me", "SESSION_BUDGET_DEBUG 应恢复原值");
+	} finally {
+		if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+		if (prevDebug === undefined) delete process.env.SESSION_BUDGET_DEBUG;
+		else process.env.SESSION_BUDGET_DEBUG = prevDebug;
+	}
 });

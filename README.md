@@ -5,7 +5,7 @@
 在 pi / pi-web 输入框上方常驻一行状态，实时显示当前会话花了多少钱、用了多少 token、缓存命中率、上下文占了多少，并把**子代理（subagent）的用量一并计入**。
 
 ```
-💰 ¥297.72 + $0.0114 (主 ¥74.49 + 子 ¥223.24 + $0.0114)   📦 上下文 168.7k / 压缩阈值 983.6k (17%)
+💰 ≈¥297.72 + $0.0114 (主 ¥74.49 + 子 ¥223.24 + $0.0114)   📦 上下文 168.7k / 压缩阈值 983.6k (17%)
 🔢 入 5.77M · 出 263.5k · 缓存读 23.95M · 缓存写 0 · 198 次调用 · 💾 缓存命中 80.6%
 🤖 子代理 21 个 · ¥223.24 + $0.0114 · 850 次调用 · 入 12.21M · 出 916.4k · 缓存读 124.79M · 💾 命中 91.1%   ↳ worker-pro ¥147.92 (496) · reviewer ¥7.49 (75)
 ```
@@ -22,6 +22,8 @@
 | **上下文占用** | 当前上下文 / 压缩阈值（读取 `settings.json` 的 `reserveTokens`，与 pi 的实际压缩时机一致） |
 | **按 profile 拆分** | 子代理行末尾按 profile（worker / reviewer / scout …）给出小计与调用次数 |
 | **多币种** | 价格表命中显示 `¥`，`models.json` 单价显示 `$`，混用时并列显示，绝不把美元标成人民币 |
+| **跨会话去重** | 按 entry 指纹（id + 时间 + 模型 + 四项 token）去重，fork / clone 副本只计一次 |
+| **真实 / 估算分列** | 价格表与 `models.json` 算出的算估算，`usage.cost.total` 算真实；widget 全估算时加 `≈`，`/budget` 给出构成 |
 | **历史重算** | 每次渲染都按**当前**价格表重算全部历史调用，换价后旧会话数字同步更新 |
 | **费用回写** | 新回复结束时把算好的费用写回消息，pi-web 自带的费用显示随之准确 |
 
@@ -94,6 +96,33 @@ bash install.sh --agent-dir /path/to/agent
 没有价格表也能用：全部走第 2 步，费用按美元估算。
 
 > 费用是估算值，最终以服务商账单为准。
+
+## 统计口径
+
+**去重**：每条 entry 有一个去重指纹 —— `sha1(id|时间|provider|model|input|output|cacheRead|cacheWrite)` 的前 16 位，**刻意不含文件路径**。
+渲染时先统计主会话并把指纹记下，再统计子代理；子代理里指纹已出现过的记录直接跳过（首见者胜）。
+因此 fork / clone 出来的会话副本（内容相同、文件不同）不会被重复计费。
+
+压缩 / 分支总结（compaction / branch_summary）这类摘要记录在指纹里统一用**空 provider / 空 model**，并携带 entry 的 `id`：同一条摘要的主会话记录与 fork 副本因此指纹一致（按 `id` 去重），而不同会话里碰巧同毫秒同 usage 的摘要也不会被误合并。摘要的**计价**仍按当前模型——指纹材料与计价口径分离。
+
+**真实 vs 估算**：两种情况分开统计，不混为一谈。
+
+| 来源 | 性质 |
+|---|---|
+| `cheapmodel-pricing.json` 价格表 | 估算（`¥`） |
+| `models.json` 单价 | 估算（`$`） |
+| 消息里的 `usage.cost.total` | pi 记录的**真实成本**（`$`） |
+
+widget 的总额在**全部来自估算**时加 `≈` 前缀（如 `💰 ≈¥297.72`）；只要有一条真实成本记录就不加。
+`/budget` 输出末尾固定给出一行构成：`成本构成：真实 $12.34 · 估算 ¥45.67`（没有真实成本时显示 `真实成本未记录`）。
+预算比较（百分比、超支、告警）仍按总额算。
+
+「没有成本记录」与「明确记录为 0」是两回事：`usage` 里**没有 `cost` 字段**（或不是有限数）时，该条调用不计入金额、也不标为真实成本，构成里显示 `真实成本未记录`；只有 `usage.cost.total` 是有限数（含显式 `0`）才算真实成本（如 `真实 $0.0000`）。
+
+**解析容错**：子会话 jsonl 按 64 KB 分块流式读取；
+单行超过 4 MiB 直接跳过（不会把整行读进内存），坏 JSON 行跳过并计数；
+compaction / branch_summary 只计顶层 `usage`，**不读 `retainedTail`**（里面是历史消息副本，读它会重复计数）。
+坏行数在子代理统计结果里汇总，设 `SESSION_BUDGET_DEBUG=1` 可看到去重跳过数与坏行数。
 
 ## 子代理是怎么算进来的
 
@@ -168,10 +197,25 @@ CM_USER=你的账号 CM_PASS=你的密码 python scripts/cheapmodel-pricing-refr
 不启动 pi 也能验证计算：
 
 ```bash
-bun run test/render-demo.ts <session.jsonl> [agentDir]
+bun run scripts/render-demo.ts <session.jsonl> [agentDir]
 ```
 
 把某个会话文件当作输入，打印渲染结果与 20 次渲染耗时。
+
+## 开发
+
+```bash
+npm test          # = node --test（Node 递归发现 test/ 下的 *.test.ts）
+```
+
+需要 Node >= 22.6（原生执行 `.ts`；实测 Node 24）。测试零第三方依赖，只用 `node:test` + `node:assert/strict`：
+
+| 目录 | 内容 |
+|---|---|
+| `test/unit/` | 去重指纹、金额与「真实/估算」分列、`parseUsageText` 解析容错 |
+| `test/contract/` | 扩展对外契约：注册的命令、渲染产物、`/budget` 写入、`ui` 缺失不崩 |
+
+> `node --test <目录>` 在 Node 24 会把目录当模块入口（报 `Cannot find module`），所以这里用不带参数的 `node --test`，由 Node 自己递归发现；演示脚本放在 `scripts/render-demo.ts` 而非 `test/`，避免被当成测试文件。
 
 ## License
 

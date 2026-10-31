@@ -1,7 +1,7 @@
 // 离线渲染演示：把某个会话文件当作输入，跑一次 session-budget 的渲染，打印到终端。
 // 用途：不启动 pi 也能检查费用/子代理/命中率的计算结果。
 //
-//   bun run test/render-demo.ts <session.jsonl> [agentDir]
+//   bun run scripts/render-demo.ts <session.jsonl> [agentDir]
 //
 // agentDir 默认为 PI_CODING_AGENT_DIR 或 ~/.pi/agent（用于读 cheapmodel-pricing.json 与 settings.json）。
 import { readFileSync } from "node:fs";
@@ -10,8 +10,10 @@ import { join, resolve } from "node:path";
 
 const sessArg = process.argv[2];
 if (!sessArg) {
-	console.error("用法: bun run test/render-demo.ts <session.jsonl> [agentDir]");
-	process.exit(1);
+	// 缺参数时只打印用法提示，退出码为 0：node --test 会把 test/ 下的文件当测试执行，
+	// 用非零退出码会让裸跑 `node --test` 出现一个假失败。
+	console.error("用法: bun run scripts/render-demo.ts <session.jsonl> [agentDir]");
+	process.exit(0);
 }
 const SESS = resolve(sessArg);
 const agentDir = process.argv[3] || process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");

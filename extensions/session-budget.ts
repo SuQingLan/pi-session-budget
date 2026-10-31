@@ -22,6 +22,7 @@
  * 没有价格表时（别人的机器）自动退化为美元口径，不会误标成 ¥。
  * 历史调用每次都按当前价格表重算。仍是估算，以中转站日志为准。
  */
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync, readdirSync, openSync, readSync, closeSync } from "node:fs";
 import { join, dirname } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -43,8 +44,8 @@ function fmtTok(n: number): string {
 	return String(n);
 }
 
-type Cur = "¥" | "$";
-interface Money { cny: number; usd: number }
+export type Cur = "¥" | "$";
+export interface Money { cny: number; usd: number }
 
 /** 币种强制：auto = 按实际计价来源（价格表=¥，models.json=$） */
 let CURRENCY: Cur | "auto" = "auto";
@@ -52,15 +53,15 @@ let CURRENCY: Cur | "auto" = "auto";
 function newMoney(): Money {
 	return { cny: 0, usd: 0 };
 }
-function addMoney(m: Money, v: number, cur: Cur): void {
+export function addMoney(m: Money, v: number, cur: Cur): void {
 	if (cur === "¥") m.cny += v;
 	else m.usd += v;
 }
-function moneyTotal(m: Money): number {
+export function moneyTotal(m: Money): number {
 	return m.cny + m.usd;
 }
 /** 主导币种：优先 ¥（价格表口径），否则 $ */
-function dominantCur(m: Money): Cur {
+export function dominantCur(m: Money): Cur {
 	return m.cny > 0 ? "¥" : "$";
 }
 function fmtNum(cur: Cur, n: number): string {
@@ -76,6 +77,52 @@ function fmtMoney(m: Money): string {
 function displayMoney(m: Money): string {
 	if (CURRENCY === "auto") return fmtMoney(m);
 	return fmtNum(CURRENCY, m.cny + m.usd);
+}
+
+/* ---------------- 成本构成：真实成本 vs 估算成本 ---------------- */
+
+/**
+ * 成本构成：
+ *   realUsd  = pi 记录在消息里的 usage.cost.total（真实成本，美元）
+ *   est      = 价格表 / models.json 单价算出的估算成本（按币种分列）
+ * 两者分开统计，widget 总额全为估算时加 ≈ 前缀，/budget 输出给出构成。
+ */
+export interface CostSplit { realUsd: number; realKnown: boolean; est: Money }
+
+export function emptyCostSplit(): CostSplit {
+	return { realUsd: 0, realKnown: false, est: newMoney() };
+}
+
+export function addToSplit(s: CostSplit, v: number, cur: Cur, kind: "real" | "est" | "unknown"): void {
+	if (kind === "real") {
+		s.realUsd += v;
+		s.realKnown = true;
+		return;
+	}
+	if (kind === "unknown") return;
+	addMoney(s.est, v, cur);
+}
+
+/** 合并两份成本构成（主会话 + 子代理） */
+function mergeSplit(into: CostSplit, from: CostSplit): void {
+	if (from.realKnown) {
+		into.realUsd += from.realUsd;
+		into.realKnown = true;
+	}
+	into.est.cny += from.est.cny;
+	into.est.usd += from.est.usd;
+}
+
+/** 总额全部来自估算时，金额前加 ≈ */
+function estOnly(s: CostSplit): boolean {
+	return !s.realKnown;
+}
+
+/** /budget 输出末尾的成本构成行（格式固定） */
+function costBreakdownText(s: CostSplit): string {
+	const real = s.realKnown ? `真实 ${fmtNum("$", s.realUsd)}` : "真实成本未记录";
+	const est = moneyTotal(s.est) > 0 ? fmtMoney(s.est) : "¥0.00";
+	return `成本构成：${real} · 估算 ${est}`;
 }
 
 /** 缓存命中率：缓存读 / 总输入（输入 + 缓存读 + 缓存写） */
@@ -138,25 +185,49 @@ function priceByTable(provider: string | undefined, model: string | undefined, u
 	return c;
 }
 
-/** 返回费用及其币种：价格表 = ¥，models.json / 消息自带 = $ */
-function callCost(ctx: any, provider: string | undefined, model: string | undefined, u: any, ts: number | undefined): { v: number; cur: Cur } {
+/**
+ * 返回费用、币种与来源：价格表 = ¥/估算，models.json 单价 = $/估算，
+ * 消息自带 usage.cost.total = $/真实。cost 缺失 / 非有限数 = unknown（不计量）。
+ */
+function callCost(ctx: any, provider: string | undefined, model: string | undefined, u: any, ts: number | undefined): { v: number; cur: Cur; kind: "real" | "est" | "unknown" } {
 	const t = priceByTable(provider, model, u, ts);
-	if (t) return { v: t.total, cur: "¥" };
+	if (t) return { v: t.total, cur: "¥", kind: "est" };
 	const price = provider && model ? ctx.modelRegistry?.find?.(provider, model)?.cost : undefined;
 	if (price && (price.input || price.output)) {
 		return {
 			v: ((u.input ?? 0) * (price.input ?? 0) + (u.output ?? 0) * (price.output ?? 0) + (u.cacheRead ?? 0) * (price.cacheRead ?? 0) + (u.cacheWrite ?? 0) * (price.cacheWrite ?? 0)) / 1_000_000,
 			cur: "$",
+			kind: "est",
 		};
 	}
-	return { v: u.cost?.total ?? 0, cur: "$" };
+	if (typeof u.cost?.total === "number" && Number.isFinite(u.cost.total)) {
+		return { v: u.cost.total, cur: "$", kind: "real" };
+	}
+	return { v: 0, cur: "$", kind: "unknown" };
 }
 
 /* ---------------- 子代理（派生会话）用量统计 ---------------- */
 
 /** 一条 assistant 调用的原始用量记录（缓存用，计价时再乘价格） */
-interface CallRecord { provider?: string; model?: string; ts?: number; usage: any }
-interface ChildStats { records: CallRecord[]; profile?: string; description?: string }
+export interface CallRecord { id?: string; provider?: string; model?: string; ts?: number; usage: any; summary?: boolean }
+interface ChildStats { records: CallRecord[]; profile?: string; description?: string; badLines: number }
+
+/* ---------------- 去重指纹 ---------------- */
+
+export interface FpInput { id?: string; ts?: number; provider?: string; model?: string; usage?: any }
+
+/** 指纹 = sha1(id|ts|provider|model|input|output|cacheRead|cacheWrite) 前 16 位；刻意不含文件路径 */
+export function usageFingerprint(p: FpInput): string {
+	const u = p.usage ?? {};
+	const material = [p.id ?? "", p.ts ?? "", p.provider ?? "", p.model ?? "", u.input ?? 0, u.output ?? 0, u.cacheRead ?? 0, u.cacheWrite ?? 0].join("|");
+	return createHash("sha1").update(material).digest("hex").slice(0, 16);
+}
+
+/** 本次渲染去重指纹集合的签名（用于子代理统计缓存 key） */
+function fpSignature(seen: Set<string>): string {
+	if (!seen.size) return "0";
+	return createHash("sha1").update(Array.from(seen).sort().join(",")).digest("hex").slice(0, 16);
+}
 
 const headerCache = new Map<string, { mtimeMs: number; size: number; parent?: string }>();
 const childCache = new Map<string, { mtimeMs: number; size: number; stats?: ChildStats }>();
@@ -183,44 +254,157 @@ function readSessionHeader(file: string): any | undefined {
 	}
 }
 
-/** 解析子会话文件：assistant 调用的 usage + 子代理档案信息 */
-function parseChildFile(file: string): ChildStats | undefined {
-	const out: ChildStats = { records: [] };
-	let text: string;
+/** 解析结果：用量记录 + 坏行计数 + 子代理档案信息 */
+export interface ParsedUsage {
+	records: CallRecord[];
+	badLines: number;
+	hasSubagentMarker: boolean;
+	profile?: string;
+	description?: string;
+}
+
+/** 增量解析状态：逐行累加，不保留原文（流式读取与整段解析共用） */
+export interface UsageParseState {
+	records: CallRecord[];
+	badLines: number;
+	hasSubagentMarker: boolean;
+	profile?: string;
+	description?: string;
+}
+
+/**
+ * 解析一行 jsonl 文本并累加到 state：
+ *   单行 UTF-8 字节超 maxLineBytes → 计 badLines，跳过（默认 4 MiB）
+ *   坏 JSON 行 → 计 badLines，跳过
+ *   compaction / branch_summary 只取顶层 usage，不读 retainedTail（否则重复计数）
+ * 空行忽略。纯函数（只改 state），便于逐行流式调用与测试。
+ */
+export function parseUsageLine(line: string, state: UsageParseState, opts?: { maxLineBytes?: number }): void {
+	const maxLineBytes = opts?.maxLineBytes ?? 4 * 1024 * 1024;
+	if (!line.trim()) return;
+	if (Buffer.byteLength(line, "utf8") > maxLineBytes) {
+		state.badLines++;
+		return;
+	}
+	let d: any;
 	try {
-		text = readFileSync(file, "utf8");
+		d = JSON.parse(line);
+	} catch {
+		state.badLines++;
+		return;
+	}
+	if (d?.type === "custom" && d?.customType === "pi-web:subagent") {
+		state.hasSubagentMarker = true;
+		state.profile = d.data?.profile;
+		state.description = d.data?.description;
+		return;
+	}
+	if (d?.type === "message" && d.message?.role === "assistant" && d.message?.usage) {
+		const m = d.message;
+		state.records.push({
+			id: d.id,
+			provider: m.provider,
+			model: m.model,
+			ts: typeof m.timestamp === "number" ? m.timestamp : Date.parse(m.timestamp),
+			usage: m.usage,
+		});
+	} else if ((d?.type === "compaction" || d?.type === "branch_summary") && d.usage) {
+		// 只计顶层 usage，retainedTail 里是历史消息的副本，读它会重复计数
+		// summary 记录带 id 并打 summary 标记：指纹时用空 provider/model，计价仍按现有口径
+		state.records.push({ id: d.id, ts: Date.parse(d.timestamp), usage: d.usage, summary: true });
+	}
+}
+
+/** 解析整段 jsonl 文本（便利包装）：按 "\n" 拆行后逐行交给 parseUsageLine */
+export function parseUsageText(text: string, opts?: { maxLineBytes?: number }): ParsedUsage {
+	const state: UsageParseState = { records: [], badLines: 0, hasSubagentMarker: false };
+	for (const line of text.split("\n")) parseUsageLine(line, state, opts);
+	return state;
+}
+
+/**
+ * 解析子会话文件（流式）：64 KB 分块读，按 "\n" 切行，每凑齐一行就立即交给
+ * parseUsageLine 累加——不累积行数组、不拼接全文，内存上限约为单行长度。
+ * 某行超过 maxLineBytes 时丢弃该行剩余部分直到下一个 "\n"（不无限累积）。
+ * 总坏行数 = 流式丢弃的超长行 + 解析失败行。
+ */
+function parseChildFile(file: string, opts?: { maxLineBytes?: number }): ChildStats | undefined {
+	const maxLineBytes = opts?.maxLineBytes ?? 4 * 1024 * 1024;
+	const CHUNK = 64 * 1024;
+	let fd: number | undefined;
+	try {
+		fd = openSync(file, "r");
 	} catch {
 		return undefined;
 	}
-	for (const line of text.split("\n")) {
-		if (!line.trim()) continue;
-		let d: any;
-		try {
-			d = JSON.parse(line);
-		} catch {
-			continue;
+	const state: UsageParseState = { records: [], badLines: 0, hasSubagentMarker: false };
+	const emit = (parts: Buffer[]) => parseUsageLine(Buffer.concat(parts).toString("utf8"), state, opts);
+	let streamBad = 0;
+	try {
+		const buf = Buffer.alloc(CHUNK);
+		let parts: Buffer[] = [];
+		let lineBytes = 0;
+		let skipLine = false;
+		for (;;) {
+			let n = 0;
+			try {
+				n = readSync(fd, buf, 0, CHUNK, null);
+			} catch {
+				break;
+			}
+			if (!n) break;
+			let start = 0;
+			while (start < n) {
+				const idx = buf.subarray(start, n).indexOf(10); // 只在本块已读范围内找换行
+				const end = idx >= 0 ? start + idx : n;
+				if (end > start && !skipLine) {
+					lineBytes += end - start;
+					if (lineBytes > maxLineBytes) {
+						skipLine = true; // 超长行：丢弃已收集部分，后续字节直接丢
+						parts = [];
+					} else {
+						parts.push(Buffer.from(buf.subarray(start, end)));
+					}
+				}
+				if (idx >= 0) {
+					if (skipLine) {
+						streamBad++;
+						skipLine = false;
+					} else if (parts.length) {
+						emit(parts); // 逐行增量解析，立即释放该行缓冲
+					}
+					parts = [];
+					lineBytes = 0;
+					start = end + 1;
+				} else {
+					start = n;
+				}
+			}
 		}
-		if (d?.type === "custom" && d?.customType === "pi-web:subagent") {
-			out.profile = d.data?.profile;
-			out.description = d.data?.description;
-			continue;
-		}
-		if (d?.type === "message" && d.message?.role === "assistant" && d.message?.usage) {
-			const m = d.message;
-			out.records.push({ provider: m.provider, model: m.model, ts: typeof m.timestamp === "number" ? m.timestamp : Date.parse(m.timestamp), usage: m.usage });
-		} else if ((d?.type === "compaction" || d?.type === "branch_summary") && d.usage) {
-			out.records.push({ ts: Date.parse(d.timestamp), usage: d.usage });
-		}
+		// 文件末尾没有换行的残留行
+		if (skipLine) streamBad++;
+		else if (parts.length) emit(parts);
+	} finally {
+		if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
 	}
-	return out;
+	return {
+		records: state.records,
+		profile: state.profile,
+		description: state.description,
+		badLines: streamBad + state.badLines,
+	};
 }
 
 interface SubUsage {
-	cost: Money; input: number; output: number; cacheRead: number; cacheWrite: number;
-	calls: number; agents: number; profiles: Record<string, { cost: Money; calls: number }>;
+	cost: Money; split: CostSplit; input: number; output: number; cacheRead: number; cacheWrite: number;
+	calls: number; agents: number; dupSkipped: number; badLines: number;
+	profiles: Record<string, { cost: Money; calls: number }>;
 }
 function emptySub(): SubUsage {
-	return { cost: newMoney(), input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0, agents: 0, profiles: {} };
+	return {
+		cost: newMoney(), split: emptyCostSplit(), input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
+		calls: 0, agents: 0, dupSkipped: 0, badLines: 0, profiles: {},
+	};
 }
 
 /** 子代理统计的整体缓存（1 秒节流，避免高频事件重复扫盘） */
@@ -230,8 +414,9 @@ let subScanCache: { at: number; key: string; value: SubUsage } | undefined;
  * 统计当前会话的所有后代会话（子代理）用量与费用。
  * sessions/<cwd-slug>/<file>.jsonl 的 header 里带 parentSession，指向父会话路径。
  */
-function collectSubagentUsage(ctx: any, sessionFile: string | undefined): SubUsage {
+function collectSubagentUsage(ctx: any, sessionFile: string | undefined, seen?: Set<string>): SubUsage {
 	const out = emptySub();
+	const seenFingerprints = seen ?? new Set<string>();
 	if (!sessionFile) return out;
 	let pricingKey = "";
 	try {
@@ -239,7 +424,8 @@ function collectSubagentUsage(ctx: any, sessionFile: string | undefined): SubUsa
 	} catch {
 		pricingKey = "-";
 	}
-	const key = `${sessionFile}|${pricingKey}`;
+	// 去重指纹集合也进 cache key：缓存结果已按本次渲染的主会话去重过
+	const key = `${sessionFile}|${pricingKey}|${fpSignature(seenFingerprints)}`;
 	if (subScanCache && subScanCache.key === key && Date.now() - subScanCache.at < 1000) return subScanCache.value;
 	let root: string;
 	try {
@@ -322,14 +508,24 @@ function collectSubagentUsage(ctx: any, sessionFile: string | undefined): SubUsa
 			childCache.set(f, { mtimeMs: st.mtimeMs, size: st.size, stats });
 		}
 		if (!stats) continue;
+		out.badLines += stats.badLines ?? 0;
 		const profile = stats.profile || "subagent";
-		const bucket = (out.profiles[profile] ??= { cost: newMoney(), calls: 0 });
 		for (const r of stats.records) {
+			// 主会话已计过的同一条 entry（fork/clone 副本）跳过；summary 记录统一用空 provider/model
+			const fp = usageFingerprint(r.summary ? { id: r.id, ts: r.ts, provider: "", model: "", usage: r.usage } : r);
+			if (seenFingerprints.has(fp)) {
+				out.dupSkipped++;
+				continue;
+			}
+			seenFingerprints.add(fp);
+			// 首次真正计入一条记录时才建 profile 桶：全部被去重跳过的 profile 不产生空桶
+			const bucket = (out.profiles[profile] ??= { cost: newMoney(), calls: 0 });
 			const u = r.usage ?? {};
 			const prov = r.provider ?? ctx.model?.provider;
 			const mod = r.model ?? ctx.model?.id;
 			const c = callCost(ctx, prov, mod, u, r.ts);
 			addMoney(out.cost, c.v, c.cur);
+			addToSplit(out.split, c.v, c.cur, c.kind);
 			out.input += u.input ?? 0;
 			out.output += u.output ?? 0;
 			out.cacheRead += u.cacheRead ?? 0;
@@ -351,6 +547,65 @@ function compactionThreshold(provider?: string, modelId?: string, contextWindow?
 	const ov = provider && modelId ? s.modelOverrides?.[`${provider}/${modelId}`] : undefined;
 	const reserve = ov?.reserveTokens ?? s.reserveTokens ?? 16384;
 	return contextWindow - reserve;
+}
+
+interface MainUsage {
+	cost: Money; split: CostSplit;
+	input: number; output: number; cacheRead: number; cacheWrite: number; calls: number;
+}
+
+/**
+ * 主会话用量统计：先于子代理执行，并把指纹写进 seen（首见者胜）——
+ * 这样 fork/clone 出来的子会话副本不会重复计费。
+ */
+function collectMainUsage(ctx: any, entries: any[], seen: Set<string>): MainUsage {
+	const out: MainUsage = { cost: newMoney(), split: emptyCostSplit(), input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 };
+	for (const e of entries) {
+		const isMsg = e.type === "message" && e.message?.role === "assistant";
+		const u = isMsg ? e.message.usage : e.type === "compaction" || e.type === "branch_summary" ? e.usage : undefined;
+		if (!u) continue;
+		// 压缩/分支总结的调用不记录模型，按当前模型估价
+		const prov = isMsg ? e.message.provider : ctx.model?.provider;
+		const mod = isMsg ? e.message.model : ctx.model?.id;
+		// 统一归一到毫秒时间戳：与 parseUsageText 解析子会话时的口径一致，指纹才能对上
+		const rawTs = isMsg ? e.message.timestamp : e.timestamp;
+		const ts = typeof rawTs === "number" ? rawTs : Date.parse(rawTs);
+		// 摘要（compaction/branch_summary）指纹统一用空 provider/model，与子会话侧一致；
+		// 计价仍用 prov/mod（当前模型），指纹材料与计价口径分离。
+		seen.add(usageFingerprint(isMsg
+			? { id: e.id, ts, provider: prov, model: mod, usage: u }
+			: { id: e.id, ts, provider: "", model: "", usage: u }));
+		out.calls++;
+		out.input += u.input ?? 0;
+		out.output += u.output ?? 0;
+		out.cacheRead += u.cacheRead ?? 0;
+		out.cacheWrite += u.cacheWrite ?? 0;
+		const c = callCost(ctx, prov, mod, u, ts);
+		addMoney(out.cost, c.v, c.cur);
+		addToSplit(out.split, c.v, c.cur, c.kind);
+	}
+	return out;
+}
+
+/** 主 + 子的成本构成（给 /budget 输出用） */
+function costSplitOf(ctx: any, entries: any[]): CostSplit {
+	const total = emptyCostSplit();
+	const seenFingerprints = new Set<string>();
+	mergeSplit(total, collectMainUsage(ctx, entries, seenFingerprints).split);
+	const cfg = readJson(join(AGENT_DIR, "session-budget.json")) ?? {};
+	if (cfg.includeSubagents !== false) {
+		mergeSplit(total, collectSubagentUsage(ctx, ctx.sessionManager.getSessionFile?.(), seenFingerprints).split);
+	}
+	return total;
+}
+
+/** /budget 输出末尾的成本构成行（算不出来时退化为空构成，不影响命令） */
+function costBreakdownLine(ctx: any, entries: any[]): string {
+	try {
+		return costBreakdownText(costSplitOf(ctx, entries));
+	} catch {
+		return costBreakdownText(emptyCostSplit());
+	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -376,27 +631,19 @@ export default function (pi: ExtensionAPI) {
 			const entries: any[] = ctx.sessionManager.getEntries();
 			const cfg = readJson(join(AGENT_DIR, "session-budget.json")) ?? {};
 			CURRENCY = cfg.currency === "¥" || cfg.currency === "$" ? cfg.currency : "auto";
-			let input = 0, output = 0, cacheRead = 0, cacheWrite = 0, calls = 0;
-			const mainCost = newMoney();
-			for (const e of entries) {
-				const isMsg = e.type === "message" && e.message?.role === "assistant";
-				const u = isMsg ? e.message.usage : e.type === "compaction" || e.type === "branch_summary" ? e.usage : undefined;
-				if (!u) continue;
-				// 压缩/分支总结的调用不记录模型，按当前模型估价
-				const prov = isMsg ? e.message.provider : ctx.model?.provider;
-				const mod = isMsg ? e.message.model : ctx.model?.id;
-				const ts = isMsg ? e.message.timestamp : Date.parse(e.timestamp);
-				calls++;
-				input += u.input ?? 0;
-				output += u.output ?? 0;
-				cacheRead += u.cacheRead ?? 0;
-				cacheWrite += u.cacheWrite ?? 0;
-				const c = callCost(ctx, prov, mod, u, ts);
-				addMoney(mainCost, c.v, c.cur);
-			}
+			const seenFingerprints = new Set<string>();
+			const main = collectMainUsage(ctx, entries, seenFingerprints);
+			const mainCost = main.cost;
+			const { input, output, cacheRead, cacheWrite, calls } = main;
 
 			const includeSub = cfg.includeSubagents !== false;
-			const sub = includeSub ? collectSubagentUsage(ctx, ctx.sessionManager.getSessionFile?.()) : emptySub();
+			const sub = includeSub ? collectSubagentUsage(ctx, ctx.sessionManager.getSessionFile?.(), seenFingerprints) : emptySub();
+			if (process.env.SESSION_BUDGET_DEBUG) {
+				console.error(`session-budget: 子代理 ${sub.agents} 个 · dupSkipped ${sub.dupSkipped} · 坏行 ${sub.badLines}`);
+			}
+			const totalSplit = emptyCostSplit();
+			mergeSplit(totalSplit, main.split);
+			mergeSplit(totalSplit, sub.split);
 			const totalCost = newMoney();
 			addMoney(totalCost, mainCost.cny, "¥");
 			addMoney(totalCost, mainCost.usd, "$");
@@ -405,7 +652,8 @@ export default function (pi: ExtensionAPI) {
 
 			const budget = sessionBudget(entries);
 			const warnAt = cfg.warnAt ?? 0.8;
-			let costPart = `💰 ${displayMoney(totalCost)}`;
+			// 总额全为估算时前缀 ≈
+			let costPart = `💰 ${estOnly(totalSplit) ? "≈" : ""}${displayMoney(totalCost)}`;
 			if (sub.agents) costPart += ` (主 ${displayMoney(mainCost)} + 子 ${displayMoney(sub.cost)})`;
 			if (budget) {
 				const spent = budget.cur === "¥" ? totalCost.cny : totalCost.usd;
@@ -443,7 +691,7 @@ export default function (pi: ExtensionAPI) {
 					.map(([name, v]) => `${name} ${displayMoney(v.cost)} (${v.calls})`)
 					.join(" · ");
 				lines.push(
-					`🤖 子代理 ${sub.agents} 个 · ${displayMoney(sub.cost)} · ${sub.calls} 次调用` +
+					`🤖 子代理 ${sub.agents} 个 · ${estOnly(sub.split) ? "≈" : ""}${displayMoney(sub.cost)} · ${sub.calls} 次调用` +
 						` · 入 ${fmtTok(sub.input)} · 出 ${fmtTok(sub.output)} · 缓存读 ${fmtTok(sub.cacheRead)} · 缓存写 ${fmtTok(sub.cacheWrite)}` +
 						` · 💾 命中 ${hitRate(sub.input, sub.cacheRead, sub.cacheWrite)}` +
 						(detail ? `   ↳ ${detail}` : ""),
@@ -461,7 +709,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_end", async (event: any) => {
 		const m = event?.message;
 		if (!m || m.role !== "assistant" || !m.usage) return;
-		const c = priceByTable(m.provider, m.model, m.usage, m.timestamp ?? Date.now());
+		const rawTs = m.timestamp ?? Date.now();
+		const ts = typeof rawTs === "number" ? rawTs : Date.parse(rawTs);
+		const c = priceByTable(m.provider, m.model, m.usage, ts);
 		if (!c) return;
 		return { message: { ...m, usage: { ...m.usage, cost: c } } };
 	});
@@ -479,14 +729,16 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const a = args.trim();
 			const low = a.toLowerCase();
+			// /budget 输出末尾固定追加成本构成行
+			const breakdown = costBreakdownLine(ctx, ctx.sessionManager.getEntries() as any[]);
 			if (!a) {
 				const b = sessionBudget(ctx.sessionManager.getEntries() as any[]);
 				const sub = collectSubagentUsage(ctx, ctx.sessionManager.getSessionFile?.());
 				const extra = sub.agents ? `，子代理 ${sub.agents} 个 / ${fmtMoney(sub.cost)}` : "";
-				ctx.ui.notify(b ? `本会话预算：${fmtNum(b.cur, b.amount)}${extra}` : `本会话未设预算（/budget 5 设为 ¥5，/budget $5 设为 $5）${extra}`, "info");
+				ctx.ui.notify((b ? `本会话预算：${fmtNum(b.cur, b.amount)}${extra}` : `本会话未设预算（/budget 5 设为 ¥5，/budget $5 设为 $5）${extra}`) + `\n${breakdown}`, "info");
 			} else if (low === "off" || low === "0") {
 				pi.appendEntry(KEY, { usd: null });
-				ctx.ui.notify("已取消本会话预算", "info");
+				ctx.ui.notify(`已取消本会话预算\n${breakdown}`, "info");
 			} else {
 				const usd = a.startsWith("$");
 				const cur: Cur = usd ? "$" : "¥";
@@ -497,7 +749,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				pi.appendEntry(KEY, { usd: n, cur });
 				warned = false;
-				ctx.ui.notify(`本会话预算已设为 ${fmtNum(cur, n)}`, "info");
+				ctx.ui.notify(`本会话预算已设为 ${fmtNum(cur, n)}\n${breakdown}`, "info");
 			}
 			render(ctx);
 		},

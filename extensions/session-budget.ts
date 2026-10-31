@@ -843,9 +843,23 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// session_info_changed：切会话时可能触发，立即重绘一次
-	for (const ev of ["session_start", "message_end", "turn_end", "agent_end", "session_compact", "model_select", "session_info_changed"] as const) {
+	/**
+	 * 事件驱动重绘：input（用户开始打字）也能触发，这样切回窗口后一敲字状态行就立刻回来，
+	 * 不用等周期重绘的间隔。input 频率高（每次按键），单独节流；其他事件保持立即渲染。
+	 */
+	let lastInputRenderAt = 0;
+	function renderOnEvent(ctx: any, throttled = false): void {
+		if (throttled) {
+			const now = Date.now();
+			if (now - lastInputRenderAt < 400) return;
+			lastInputRenderAt = now;
+		}
+		render(ctx);
+	}
+
+	for (const ev of ["session_start", "message_end", "turn_end", "agent_end", "session_compact", "model_select", "session_info_changed", "input"] as const) {
 		try {
-			pi.on(ev as any, async (_e: any, ctx: any) => render(ctx));
+			pi.on(ev as any, async (_e: any, ctx: any) => renderOnEvent(ctx, ev === "input"));
 		} catch {
 			// 某些事件名在旧版本不存在时忽略
 		}

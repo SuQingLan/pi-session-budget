@@ -99,7 +99,9 @@ SSE 重连和会话复用都不会重新触发 `session_start`。于是只要那
 - 调大（如 `10000`）：更省 CPU，但掉线的状态行可能空上十秒。
 - 设为 `0`：完全关闭。概率上仍然能用（事件触发时照常渲染），但**错过一次推送就会一直空着**，
   直到下一次 `session_start` / `message_end` / `turn_end` / `agent_end` / `session_compact` /
-  `model_select` / `session_info_changed`。
+  `model_select` / `session_info_changed` / `input`。
+- 事件触发里包含 **`input`**（用户开始打字）：切回窗口后一敲字，状态行**立即**回来，不用等周期重绘的间隔。
+  `input` 频率高（每次按键），因此单独做了 400 ms 节流；其余事件保持立即渲染。
 - 临时关闭或临时改间隔用环境变量 `SESSION_BUDGET_REFRESH_MS`（优先于配置文件），非法值按默认 2000 处理。
 - 无 UI 的环境（`ctx.hasUI === false` 或没有 `ui.setWidget`）不启动定时器；定时器带 `unref()`，
   不会阻止 pi 进程退出；会话结束（`session_shutdown`）时停表。
@@ -222,7 +224,7 @@ CM_USER=你的账号 CM_PASS=你的密码 python scripts/cheapmodel-pricing-refr
 
 | 路径 | 用途 |
 |---|---|
-| `pi.on` | 订阅 `session_start` / `message_end` / `turn_end` / `agent_end` / `session_compact` / `model_select` / `session_info_changed`（立即重绘）与 `session_shutdown`（停表） |
+| `pi.on` | 订阅 `session_start` / `message_end` / `turn_end` / `agent_end` / `session_compact` / `model_select` / `session_info_changed` / `input`（立即重绘）与 `session_shutdown`（停表） |
 | `pi.registerCommand` | 注册 `/budget` |
 | `pi.appendEntry` | 把预算写进会话（`/budget 5`、`/budget off`） |
 | `ctx.ui.setWidget` | 渲染状态行 |

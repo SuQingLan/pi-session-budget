@@ -192,6 +192,38 @@ test("注册了名为 budget 的命令", async () => {
 	});
 });
 
+test("input 事件会触发渲染（切回窗口后一敲字状态行就回来）", async () => {
+	await withTempDir(async (root) => {
+		const agentDir = join(root, "agent");
+		mkdirSync(agentDir, { recursive: true });
+		const mod = await loadExt(agentDir);
+		const { pi, handlers } = makeHost();
+		mod.default(pi);
+		const entries = [msgEntry({ id: "m1", usage: { input: 1000, output: 500, cacheRead: 200, cacheWrite: 100, cost: { total: 12.34 } } })];
+		const { ctx, widgets } = makeCtx({ entries });
+		await fire(handlers, "input", ctx);
+		assert.ok(widgets.length >= 1, "input 事件应调用 setWidget");
+		assert.ok(widgets[widgets.length - 1].lines.join("\n").includes("💰"), "应渲染出费用行");
+	});
+});
+
+test("400ms 内的重复 input 被节流（连击不反复渲染）", async () => {
+	await withTempDir(async (root) => {
+		const agentDir = join(root, "agent");
+		mkdirSync(agentDir, { recursive: true });
+		const mod = await loadExt(agentDir);
+		const { pi, handlers } = makeHost();
+		mod.default(pi);
+		const entries = [msgEntry({ id: "m1", usage: { input: 1000, output: 500, cacheRead: 200, cacheWrite: 100, cost: { total: 12.34 } } })];
+		const { ctx, widgets } = makeCtx({ entries });
+		await fire(handlers, "input", ctx);
+		const n = widgets.length;
+		await fire(handlers, "input", ctx);
+		await fire(handlers, "input", ctx);
+		assert.equal(widgets.length, n, "节流窗口内的重复 input 不应再次渲染");
+	});
+});
+
 test("session_start → message_end 触发 setWidget，且 message_end 使调用次数 +1", async () => {
 	await withTempDir(async (root) => {
 		const agentDir = join(root, "agent");
